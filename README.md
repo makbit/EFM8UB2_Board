@@ -1,11 +1,12 @@
-### Example firmware for my **EFM8UB2 development board** based on [SiLbas 8-bit MCU](https://www.silabs.com/products/mcu/8-bit).
+### Example firmware for **EFM8UB2 development board** based on [8-bit SiLbas MCU](https://www.silabs.com/products/mcu/8-bit).
 > These simple projects can be used for tutorial purposes.
-Required header files and libraries are stored in `inc` and `lib` folders.
-Project files were created with the [Keil uVision C51](http://www.keil.com/c51/).
-> Functions for initialization for the on-board perephirials are located in `board.c` file.
-# EFM8UB2_Board
+[The Configuration Wizard 2](https://www.silabs.com/products/development-tools/software/8-bit-8051-microcontroller-software) was used to create [`board.cwg`](board.cwg) file and to manage on-board ports and perepherials (SPI, UART, I2C, etc).
+Required header files and libraries are stored in `inc` and `lib` folders. Project files were created with the [Keil uVision C51](http://www.keil.com/c51/).
+> Functions for initialization of the on-board perephirials are located in [`board.c`](board.c) file. Pins definitions and function prototypes can be found in [`board.h`](board.h) file.
+
+# EFM8UB2_Board aka SilDuino :smile:
 ![EFM8UB2_Board](EFM8UB2_Board.jpg)
-# This is the MCU
+# This is the MCU :cool:
 ![EFM8UB2_Board_MCU](EFM8UB2_Board_MCU.jpg)
 ## TODO
 - [x] Initial commit :+1:
@@ -14,4 +15,4 @@ Project files were created with the [Keil uVision C51](http://www.keil.com/c51/)
 - [ ] Upload schematis
 - [ ] Write an article
 
-P.S. [GitHub readme tips&tricks](https://help.github.com/articles/basic-writing-and-formatting-syntax/)
+[GitHub readme tips&tricks](https://help.github.com/articles/basic-writing-and-formatting-syntax/)
