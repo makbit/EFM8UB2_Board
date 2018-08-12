@@ -20,8 +20,8 @@ void main()
 	int i;
 	
 	PCA0MD     = 0;                    // Disable watchdog timer
-    P2SKIP     = 0x0F;                 // P2_0..P2_3 not used
-    P2MDOUT    = 0xF0;                 // P2_4..P2_7 is output
+	P2SKIP     = 0x0F;                 // P2_0..P2_3 not used
+	P2MDOUT    = 0xF0;                 // P2_4..P2_7 is output
 	XBR1       = 0x40;                 // Enable ports
 
 	LED_BLUE   = 0;                    // Turn off Blue
