@@ -1,12 +1,12 @@
-/*-----------------------------------------------------------------------------
-	Info: This example demonstrates how to use PCA for PWM led blinking.
-	Note: 1) High-Speed mode is not fast, it is good for beeper <100kHz.
-	      2) Frequency mode is good for oscillator up to 48MHz/2!
-		  3) PWM is easy in 8-bit mode, no IRQ. Use eComp to disable.
-		     PWM frequency is: SYSCLK/255 (188kHz @48MHz, 11kHz @3MHz).
-	Platform: Silicon Labs EFM8UB2
-	Date: July 2018
------------------------------------------------------------------------------*/
+/*----------------------------------------------------------------------------*
+*   Info: This example demonstrates how to use PCA for PWM led blinking.      *
+*   Note: 1) High-Speed mode is not fast, it is good for beeper <100kHz.      *
+*         2) Frequency mode is good for oscillator up to 48MHz/2!             *
+*         3) PWM is easy in 8-bit mode, no IRQ. Use eComp to disable.         *
+*            PWM frequency is: SYSCLK/255 (188kHz @48MHz, 11kHz @3MHz).       *
+*   Platform: Silicon Labs EFM8UB2                                            *
+*   Date: July 2018                                                           *
+*----------------------------------------------------------------------------*/
 #include <SI_EFM8UB2_Defs.h>
 
 #define PWM_LED_GREEN           PCA0CPH2
