@@ -1,24 +1,37 @@
 #include "board.h"
 
-void _Empty() {}
+/*===========================================================================*
+The 8051 memory model contains several different types of segments including:
+	- DATA (128 bytes)
+	- IDATA (128 bytes)
+	- PDATA (first 256 bytes of XDATA)
+	- XDATA (up to 64 KB)
+	- CODE (up to 64 KB)
+DATA, IDATA, PDATA, and XDATA all allow read and write access, whereas CODE is
+read only.  The memory segments are listed in order of speed and code efficiency.
+
+Timers usage:
+	I2C   => Timer0 (clock), Timer3 (overflow)
+	UART0 => Timer1 (baud rate generator)
+	Timer0 and Timer1 share SYSCLK divider.
+ *===========================================================================*/
+
 //===========================================================================//
 // Extern variables (flags), SYSCLK after Reset is 1.5MHz                    //
 //===========================================================================//
 uint32_t  xdata g_SYSCLK           = 1500000UL;
 uint8_t   xdata g_PortInit         = 0;
-SI_UU16_t xdata g_NextPcaValue     = { 0 };
-uint16_t  xdata g_HighSpeedPCA     = 1500 / (1 * 2);
-uint16_t  xdata g_SystemTick       = 0;
-void            (*g_TickHandler)() = &_Empty;
+uint16_t  pdata g_SystemTick       = 0;
+uint16_t  pdata g_HighSpeedPCA     = 1500 / (1 * 2);
+SI_UU16_t pdata g_NextPcaValue     = { 0 };
 
 struct I2C_Data
 {
-	uint8_t Data[4];                   // 0: Address, 1..3: Data In/Out
-	uint8_t Count;                     // Data byte count
-	uint8_t Busy;                      // Busy flag
-	uint8_t Read;                      // I/O direction (1-read, 0-write)
-	uint8_t Errors;                    // Error counter
-} xdata _i2c = { 0 };
+	uint8_t Data[7];                   // I2C Address[0], Data In/Out [1..6]
+	uint8_t Count : 4;                 // Data count (1..6)
+	uint8_t Busy  : 1;                 // Busy flag
+	uint8_t Error : 3;                 // Error flag/bits (TimeOut | Arbitr | i/o)
+} xdata i2c = { 0 };
 
 //===========================================================================//
 // To configure a pin as a digital input:
@@ -40,7 +53,7 @@ void Port_IO_Init()
 	P4MDIN          = 0xFF;            // Digital (default)
 
 	// 0 - OpenDrain, 1 - Push-Pull
-	P0MDOUT         = 0x10;            // Push-Pull: Uart_TX
+	P0MDOUT         = 0x10;            // Push-Pull: Uart_TX, Open-Drain: *
 	P1MDOUT         = 0xCD;            // OpenDrain: Miso, Cnvt, VRef
 	P2MDOUT         = 0xFC;            // OpenDrain: SDA, SCL
 	P3MDOUT         = 0x7F;            // OpenDrain: Card_CDN
@@ -49,7 +62,7 @@ void Port_IO_Init()
 	// Skip & XBR registers depends on perephirals selected.
 	P0SKIP          = 0xCF;            // 4,5 - UART
 	P1SKIP          = 0xF0;            // 0..3 - SPI
-	P2SKIP          = 0x70;            // 0,1 - I2C, 2 - SysClk, 3,7-PCA
+	P2SKIP          = 0x70;            // 0,1 - I2C, 2 - SysClk, 3..7-PCA
 	P3SKIP          = 0xFE;            // 0 - PCA (CEX2)
 
 	// Disable digital output drivers by writing 1 to latch register.
@@ -103,9 +116,9 @@ void Port_IO_Init()
 	//-----------------------------------------------------------//
 	// PCA:   0-Disable, 1-CEX0, 2-CEX0_CEX1, 3,4,5-CEX0..4      //
 	//-----------------------------------------------------------//
-	XBR0            = 0x0F; // SYSCLK out, I2C, SPI, UART
-	XBR1            = 0x43; // XBAR0, CEX0..CEX2 (Beeper, Yellow, FifoClk).
-	g_PortInit      = 1;    // Global flag: initialization complete.
+	XBR0            = 0x0F;            // SYSCLK out, I2C, SPI, UART
+	XBR1            = 0x43;            // XBAR0, CEX0..CEX2 (Beeper, Yellow, FifoClk).
+	g_PortInit      = 1;               // Global flag: initialization complete.
 }
 
 //===========================================================================//
@@ -113,19 +126,16 @@ void Port_IO_Init()
 //===========================================================================//
 void Oscillator_Init(uint32_t nCpuSpeed)
 {
-	uint16_t i;
+	uint16_t xdata i;
 
 	// Reset on:
 	// 0x02: VDD Monitor reset.
 	// 0x04: Missing clock detector - hangs with debugger.
 	// 0x80: USB reset - fails to start with VCPXpress.
-	RSTSRC = 0x02;
-	// Flash one-shot enabled (recommended, p.27)
-	FLSCL = 0x80;
-	//Prefetch Engine Control - read 2 instructions per clock
-	PFE0CN |= 0x20;
-	// VDD Monitor enable
-	VDM0CN = 0x80;
+	RSTSRC  = 0x02;                    // Setup reset sources (VDD only)
+	FLSCL   = 0x80;                    // Flash one-shot enabled (recommended, p.27)
+	PFE0CN |= 0x20;                    // Prefetch Engine Control - read 2 instr per clock
+	VDM0CN  = 0x80;                    // VDD Monitor enable
 
 	switch( nCpuSpeed )
 	{
@@ -188,7 +198,7 @@ void Oscillator_Init(uint32_t nCpuSpeed)
 		} break;
 		case CPU_SPEED_DEFAULT:        // Page 49: 48 MHz/4/8 = 1.5MHz
 		default:
-			g_SYSCLK = 1500000UL;
+			g_SYSCLK = 1500000UL;      // Default frequency 1.5MHz
 			break;
 	}
 	if( nCpuSpeed != CPU_SPEED_EXT )
@@ -250,42 +260,6 @@ void PCA0_ISR(void) interrupt PCA0_IRQn
 }
 
 //===========================================================================//
-// Timer 0: 8-bit timer with autoreload (p.252)                              //
-// Based on SysClk/48; Ftimer = Fsys / (256 - TH0); [3.9kHz..480kHz]         //
-//===========================================================================//
-//void Timer0_ISR(void) interrupt TIMER0_IRQn { // Write your own handler! }
-void Timer0_Init()
-{
-	CKCON0   |= 0x02;                  // Timer0 clock prescaler = SysClk/48
-	TMOD     |= 0x02;                  // Timer0 Mode Select (8-bit, autoreload)
-	TL0 = TH0 = 6;                     // Slowest precise: 1M / (256-6) = 4kHz
-	TCON_TR0  = 1;                     // Start Timer0
-	IE_ET0    = 1;                     // Timer0 interrupt enabled
-}
-
-//===========================================================================//
-// Timer 2: 16-bit timer with autoreload                                     //
-// Note: Ftimer = Fsys / (65536 - TMR0RLH:TMR0RLL)                           //
-//===========================================================================//
-void Timer2_Init(uint16_t f)
-{
-	if( f==0 ) f = 1000 ;              // Default value: 1000kHz
-	TMR2CN0      = 0;                  // Timer2 SysClk/12, Auto, RunCtrl off
-	TMR2RL       = 65536 - g_SYSCLK/(12*f); // Timer2 limit, 1ms default
-	TMR2         = TMR2RL;             // Timer2 initial counter value
-	TMR2CN0_TR2  = 1;                  // Run Timer2
-	IE_ET2       = 1;                  // Timer2 interrupt enabled
-}
-
-//===========================================================================//
-void Timer2_ISR(void) interrupt TIMER2_IRQn
-{
-	g_SystemTick++;                    // Every millisecond (1/1000s)
-	(*g_TickHandler)();                // Call SysTick_Handler
-	TMR2CN0_TF2H = 0;                  // Reser IRQ flag
-}
-
-//===========================================================================//
 // EXTernal interrupt configuration (p. 84)                                  //
 // Two direct-pin interrupt sources INT0 & INT1, level or edge sensitive.    //
 // Note:                                                                     //
@@ -300,12 +274,12 @@ void INT01_Init(void)
 	// IT01CF: || IN1PL |    IN1SL    || IN0PL |    IN0SL     ||  //
 	//         ||   1   |  0   1   1  ||   1   |   0   1   0  ||  //
 	//------------------------------------------------------------//
+	IT01CF    |= 0x0A;                 // INT0: PolActHigh, P0_2 (VSync)
+	IT01CF    |= 0xB0;                 // INT1: PolActHigh, P0_3 (Radio)
 	TCON_IT0   = 1;                    // INT0 is edge triggered.
 	TCON_IT1   = 1;                    // INT1 is edge triggered.
 	TCON_IE0   = 0;                    // Clear initial ExtInt 0
 	TCON_IE1   = 0;                    // Clear initial ExtInt 1
-	IT01CF    |= 0x0A;                 // INT0: PolActHigh, P0_2 (VSync)
-	IT01CF    |= 0xB0;                 // INT1: PolActHigh, P0_3 (Radio)
 	IE_EX0     = 1;                    // Enable external events /INT0
 	IE_EX1     = 1;                    // Enable external events /INT1
 }
@@ -316,11 +290,336 @@ void INT01_Init(void)
 //void Int1_ISR(void) interrupt INT1_IRQn { }
 
 //===========================================================================//
-// UART0 on pins 4, 5                                                        //
+// Timer 0: 8-bit timer with autoreload (p.252) (used by I2C)                //
+// Based on SysClk/12; Ftimer = Fsys / (256 - TH0); [15.6kHz..4MHz]          //
+// Timers #0 and #1 share frequency divider!                                 //
 //===========================================================================//
-void UART_Init()
+void Timer0_Init(uint32_t f)
 {
-	SCON0 = 0x10;
+	f = g_SYSCLK / (f*12);             // SCL counter (30kHz, 100kHz, 400kHz)
+	if( f < 1   ) f = 1;               // Minimum frequency divider
+	if( f > 255 ) f = 255;             // Maximum frequency divider
+	//------------------------------------------------------------//
+	// CKCON0 : T3MH | T3ML | T2MH | T2ML || T1M | T0M |  SCA  |  //
+	//           e/s | e/s  | e/s  | e/s  || p/s | p/s |  div  |  //
+	// e(0) - external, s(1) - sysclk, p(0) - prescale.           //
+	//------------------------------------------------------------//
+	CKCON0  &= 0xF0;                   // Timer0,1 clock prescaler (SysClk/12)
+	TMOD    |= 0x02;                   // Timer0 Mode2 Select (8-bit, autoreload)
+	TH0      = 256 - (uint8_t)f;       // Set initial counter value (100kHz)
+	TL0      = TH0;                    // Set counter
+	TCON_TR0 = 1;                      // Start Timer0
+	IE_ET0   = 0;                      // Timer0 interrupts disabled (not used)
+}
+
+//===========================================================================//
+// Timer 1: 8-bit timer with autoreload (p.252) (used by UART0)              //
+//===========================================================================//
+void Timer1_Init(uint32_t f)
+{
+	f = g_SYSCLK/(f*12);               // UART Baudrate (9600, 31250, 115200)
+	if( f < 1   ) f = 1;               // Minimum frequency divider
+	if( f > 255 ) f = 255;             // Maximum frequency divider
+	//------------------------------------------------------------//
+	// TMOD : GATE1 | CT1 |   T1M   || GATE0 | CT0 |   T0M   |    //
+	//         int1 | t/e |   mode  ||  int0 | t/e |  mode   |    //
+	//------------------------------------------------------------//
+	CKCON0  &= 0xF0;                   // Timer0,1 clock control (SYSCLK/12)
+	TMOD    |= 0x20;                   // Timer1 Mode2 Select (8-bit, autoreload)
+	TH1      = 256 - (uint8_t)f;       // Set initial counter value
+	TL1      = TH1;                    // TLow := THigh
+	TCON_TR1 = 1;                      // Timer1 enable
+	IE_ET1   = 0;                      // Timer0 interrupts disabled (not used)
+}
+
+//===========================================================================//
+// Timer 2: 16-bit timer with autoreload [62Hz..800kHz]                      //
+// Note: Ftimer = Fsys / (65536 - TMR0RLH:TMR0RLL)                           //
+//       MCU is too slow to process IRQ @1MHz+                               //
+//===========================================================================//
+void Timer2_Init(uint32_t f)
+{
+	f = g_SYSCLK / (12*f);             // Timer2 counter
+	if( f < 1     ) f = 1;             // Minimum frequency: 62 Hz (4M/65536)
+	if( f > 65535 ) f = 65535;         // Maximum frequency: 4 MHz (4M/1)
+	CKCON0      &= 0xCF;               // Timer2 configured with TMR2CN reg
+	TMR2CN0      = 0;                  // Timer2 SysClk/12, Auto, RunCtrl off
+	TMR2RL       = 65536 - (uint16_t)f;// Timer2 initial counter value
+	TMR2         = TMR2RL;             // Timer2 counter
+	TMR2CN0_TR2  = 1;                  // Run Timer2
+	IE_ET2       = 1;                  // Timer2 interrupts enabled
+}
+
+//===========================================================================//
+void Timer2_ISR(void) interrupt TIMER2_IRQn
+{
+	g_SystemTick++;                    // Every millisecond (1/1000s)
+	TMR2CN0_TF2H = 0;                  // Reser IRQ flag
+}
+
+//===========================================================================//
+// Timer 3: 16-bit timer with autoreload, (25mS for I2C control)             //
+// Range: [62Hz..800kHz],      Note: 25mS = 40Hz                             //
+//===========================================================================//
+void Timer3_Init(uint32_t f)
+{
+	f = g_SYSCLK / (12*f);             // Timer3 divider
+	if( f < 1     ) f = 1;             // Minimum frequency: 62 Hz (4M/65536)
+	if( f > 65535 ) f = 65535;         // Maximum frequency: 4 MHz (4M/1 xIRQ)
+	CKCON0  &= 0x3F;                   // Timer3 configured with TMR3CN reg
+	TMR3CN0  = 0;                      // Timer3: 16-bit autoreload, SYSCLK/12
+	TMR3RL   = 65536 - (uint16_t)f;    // Timer3 configured to overflow after 15ms (~25ms)
+	TMR3     = TMR3RL;                 // Timer2 counter
+	TMR3CN0 |= 0x04;                   // Timer3 enable
+	EIE1    |= 0x80;                   // Timer3 interrupts enable ("Reset SMB in IRQ")
+}
+
+//===========================================================================//
+// Timer3 Interrupt Service Routine indicates an SMBus SCL low timeout.      //
+// The I2C/SMBus is disabled and re-enabled here.                            //
+//===========================================================================//
+void Timer3_ISR(void) interrupt TIMER3_IRQn
+{
+	SMB0CF     &= 0x7F;                // Disable SMBus
+	SMB0CF     |= 0x80;                // Re-enable SMBus
+	SMB0CN0_STA = 0;                   // Clear any START on the bus
+	TMR3CN0    &= 0x3F;                // Clear Timer3 interrupt-pending flags
+	i2c.Error   = 0x04;                // Timeout Error
+	i2c.Busy    = 0;                   // Set I2C/SMBus to free state
+}
+
+//===========================================================================//
+// I2C (SMBus), p.224                                                        //
+//===========================================================================//
+void I2C_Reset(void)
+{
+	volatile uint8_t xdata i;
+	uint8_t xdata xbr0   = XBR0;
+	uint8_t xdata xbr1   = XBR1;
+	uint8_t xdata p2out  = P2MDOUT;
+	uint8_t xdata p2skip = P2SKIP;
+
+	// Check if slave is holding SDA low (because of an improper reset or error).
+	while( I2C_SDA==0 )
+	{
+		// Provide clock pulses to allow the slave to advance out
+		// of its current state. This will allow it to release SDA.
+		XBR0     = 0;                  // Disable ALL perephirals
+		XBR1     = 0x40;               // Enable Crossbar
+		P2MDOUT  = 0xFC;               // Set I2C pins to Oped-Drain
+		P2SKIP   = 0;                  // Manual control over these pins
+		I2C_SCL  = 0;                  // Drive the clock low
+		for( i = 0; i < 255; i++ ) ;   // Hold the clock low
+		I2C_SCL  = 1;                  // Release the clock
+		while( I2C_SCL==0 ) {}         // Wait for open-drain pin to rise
+		for( i = 0; i < 50; i++ ) ;    // Hold the clock high
+		XBR1     = 0;                  // Disable Crossbar
+   }
+
+   P2MDOUT = p2out;                    // Restore config registers
+   P2SKIP  = p2skip;
+   XBR0    = xbr0;
+   XBR1    = xbr1;
+}
+
+//===========================================================================//
+// I2C_Init() includes Timer0 and Timer3 init                                //
+// SMBus configured as follows:                                              //
+//    - SMBus enabled                                                        //
+//    - Slave mode inhibited                                                 //
+//    - Timer0 used as clock source, overflow at 1/3 the SCL rate            //
+//    - Setup and hold time extensions enabled                               //
+//    - Bus Free and SCL Low timeout detection enabled (Timer3)              //
+// Note:                                                                     //
+//    Make sure the Timer0 can produce the required frequency in 8-bit mode. //
+//    Min frequency: 48M / 256 / 3 = 62.5k                                   //
+//===========================================================================//
+void I2C_Init(uint32_t nSpeed)
+{
+	Timer0_Init(nSpeed);               // SCL counter (3/2)
+	Timer3_Init(40);                   // 25ms (40Hz) I2C low timeout detector
+	//----------------------------------------------------------------//
+	// SMB0CF: || EnSMB | Inh | Busy|ExtHld||SmbTOE|SmbFTE| SMB CS || //
+	//         ||   0   |  1  |  0  |   1  ||  1   |  1   |   00   || //
+	//----------------------------------------------------------------//
+	SMBTC   = 0x0A;                    // Add 4 SysClks to hold time window
+	SMB0CF  = 0x00;                    // SMB Clock Source: Timer0 OverFlow
+	SMB0CF |= 0x04;                    // Enable SMBus Free timeout detection
+	SMB0CF |= 0x08;                    // Enable SCL low timeout detection (Timer 3)
+	SMB0CF |= 0x10;                    // Enable setup & hold time extensions
+	SMB0CF |= 0x40;                    // Slave inhibit (disable slave IRQs)
+	SMB0CF |= 0x80;                    // Enable I2C/SMBus
+	EIE1   |= 0x01;                    // Enable I2C/SMB interrupts
+}
+
+//===========================================================================//
+typedef enum
+{
+	I2C_MASTER_START  = 0xE0,          // start transmitted (master)
+	I2C_MASTER_TXDATA = 0xC0,          // data byte transmitted (master)
+	I2C_MASTER_RXDATA = 0x80,          // data byte received (master)
+	I2C_SLAVE_ADDRESS = 0x20,          // slave address received (slave)
+	I2C_SLAVE_RX_STOP = 0x10,          // STOP detected during write (slave)
+	I2C_SLAVE_RXDATA  = 0x00,          // data byte received (slave)
+	I2C_SLAVE_TXDATA  = 0x40,          // data byte transmitted (slave)
+	I2C_SLAVE_TX_STOP = 0x50,          // STOP detected during a write (slave)
+} I2C_State_t;
+
+//===========================================================================//
+// I2C/SMBus Interrupt Service Routine (ISR)                                 //
+//===========================================================================//
+// I2C/SMBus ISR state machine                                               //
+//    - Master only implementation                                           //
+//    - All outgoing/incoming data is read/written to i2c.Data[1..6]         //
+//===========================================================================//
+void I2C_ISR(void) interrupt SMBUS0_IRQn
+{
+	if( 0==SMB0CN0_ARBLOST )                // No arbitration errors
+	{
+		switch( SMB0CN0 & 0xF0 )            // Get status bits for master (4-bits)
+		{
+
+			case I2C_MASTER_START:          // START condition transmitted
+				SMB0CN0_STA = 0;            // Manually clear START bit
+				SMB0CN0_STO = 0;            // Manually clear STOP bit
+				SMB0DAT     = i2c.Data[0];  // Write address [0] of the target slave
+				break;
+
+			case I2C_MASTER_TXDATA:         // Address or Data byte was transmitted
+				if( SMB0CN0_ACK )           // Slave has sent ACK (1) or NACK (0)
+				{
+					if( i2c.Data[0] & 1 )   // If it is READ cmd, then do nothing
+					{
+						// If this transfer is a READ, proceed with transfer
+						// without writing to SMB0DAT (address was sent)
+					}
+					else                    // It is WRITE cmd
+					{
+						if( i2c.Count )     // If there are some bytes to send
+						{                   // Send data byte (from end of array)
+							SMB0DAT = i2c.Data[i2c.Count--]; 
+						}
+						else                // If there are no data bytes to send
+						{
+							SMB0CN0_STO = 1;// Set STOP to terminate transfer
+							i2c.Busy    = 0;// And free SMBus interface
+						}
+					}
+				}
+				else                        // The slave has sent NACK (no reply)
+				{
+					SMB0CN0_STO = 1;        // Send STOP condition, 
+					SMB0CN0_STA = 0;        // NOT followed by a START
+					i2c.Error   = 1;        // Indicate error (no reply)
+					i2c.Busy    = 0;        // And free SMBus interface
+				}
+				break;
+
+			case I2C_MASTER_RXDATA:         // Data byte received
+				if( i2c.Count )             // Check for free space
+				{                           // Store received byte @1
+					i2c.Data[i2c.Count--] = SMB0DAT;
+				}
+				else
+				{
+					i2c.Error = 1;          // No free space, error
+				}
+				if( i2c.Count==0 )
+				{
+					SMB0CN0_ACK = 0;        // Send NACK to indicate last byte tx
+					SMB0CN0_STO = 1;        // Send STOP to terminate transfer
+					i2c.Busy    = 0;        // Free SMBus interface
+				}
+				else
+				{
+					SMB0CN0_ACK = 1;        // Send ACK to continue RX
+				}
+				break;
+
+			default:
+				i2c.Error = 0x7;            // Indicate failed transfer, see end of ISR
+				break;
+		}
+	}
+	else
+	{
+		i2c.Error = 0x02;              // Set error flag, stop transmission
+	}
+
+	if( i2c.Error )                    // If the transfer failed...
+	{                                  // RESET to default values
+		SMB0CF     &= 0x7F;            // Disable I2C/SMBus
+		SMB0CF     |= 0x80;            // Enable I2C/SMBus
+		SMB0CN0_STA = 0;               // No START sequence
+		SMB0CN0_STO = 0;               // No STOP condition
+		SMB0CN0_ACK = 0;               // No active ACK
+		i2c.Busy    = 0;               // Free SMBus
+	}
+	SMB0CN0_SI = 0;                    // Clear interrupt flag
+}
+
+
+//===========================================================================//
+// I2C_Write() - writes a single byte to the slave with address specified    //
+//               by the <TARGET> variable. See i2c struct;                   //
+//===========================================================================//
+void I2C_Write(uint8_t addr, uint8_t value)
+{
+	i2c.Data[0] = addr & 0xFE;         // Set slave address as a reciever
+	i2c.Data[1] = value;               // Set value to transfer
+	i2c.Count   = 1;                   // Number of bytes to transfer
+	i2c.Busy    = 1;                   // Set I2C/SMBus to busy state
+	i2c.Error   = 0;                   // Clear error flag
+	SMB0CN0_STA = 1;                   // Start transfer
+	while( i2c.Busy ) ;                // Wait for I2C/SMBus to be free.
+}
+
+//===========================================================================//
+// I2C_Read() - reads a single byte from the slave with address specified    //
+//              by the <TARGET> variable.                                    //
+//===========================================================================//
+uint8_t I2C_Read(uint8_t addr)
+{
+	i2c.Data[0] = addr | 0x01;         // Set slave address as a transmiter
+	i2c.Data[1] = 0;                   // Set default value to 0
+	i2c.Count   = 1;                   // Number of bytes to recieve
+	i2c.Busy    = 1;                   // Set I2C/SMBus to busy state
+	i2c.Error   = 0;                   // Clear error flag
+	SMB0CN0_STA = 1;                   // Start transfer
+	while( i2c.Busy ) ;                // Wait for transfer to complete
+	return i2c.Data[1];
+}
+
+//===========================================================================//
+void I2C_WriteReg(uint8_t addr, uint8_t reg, uint8_t value)
+{
+	// Note: Transmits last byte 1st.
+	i2c.Data[0] = addr & 0xFE;         // Set slave address as a reciever
+	i2c.Data[1] = value;               // Set Data#2 to transfer (reversed order)
+	i2c.Data[2] = reg;                 // Set Data#1 to transfer (see order in IRQ)
+	i2c.Count   = 2;                   // Number of bytes to transfer
+	i2c.Busy    = 1;                   // Set I2C/SMBus to busy state
+	i2c.Error   = 0;                   // Clear error flag
+	SMB0CN0_STA = 1;                   // Start transfer
+	while( i2c.Busy ) ;                // Wait for I2C/SMBus to be free.
+}
+
+//===========================================================================//
+uint8_t I2C_ReadReg(uint8_t addr, uint8_t reg)
+{
+	I2C_Write( addr, reg );
+	return i2c.Error ? 0 : I2C_Read(addr);
+}
+
+//===========================================================================//
+// UART0 on P0 pins 4, 5                                                     //
+//===========================================================================//
+void UART0_Init(uint32_t baudRate)
+{
+	Timer1_Init(baudRate*2);           // Set Baudrate, example @115200
+	SCON0  = 0x10;                     // 8-bit mode, TI/RI clear, Rcv Enable
+	IP    |= 0x10;                     // UART0 high priority (PS0)
+	IE_ES0 = 1;                        // Enable UART0 interrupts
 }
 
 //===========================================================================//
@@ -347,265 +646,23 @@ void SPI_Init(uint32_t nSpeed)
 
 
 //===========================================================================//
-uint8_t SPI_io(uint8_t tx)             // Page: 216
+uint8_t SPI_io(uint8_t b)             // Page: 216
 {
-	uint8_t rx;
-	uint16_t i;
-
 	if( SPI0CN0_WCOL )                 // Clear: Write collision flag error
 		SPI0CN0_WCOL = 0;
 	if( SPI0CN0_MODF )                 // Clear: Mode fault flag
 		SPI0CN0_MODF = 0;
 	if( SPI0CN0_RXOVRN )               // Clear: Receive overrun flag
 		SPI0CN0_RXOVRN = 0;
+	
 	SPI0CN0_NSSMD0 = 0;                // Manual NSS (not slave select) for SPI
-	SPI0DAT = tx;                      // Start transmit
-	for( i = 0; i < 5000 && SPI0CN0_SPIF==0; i++ )
-	{
-		_nop_();                       // Wait for i/o complete
-	}
-	rx = SPI0DAT;                      // Store rx data
+	SPI0DAT = b;                       // Start transmit
+	while( SPI0CN0_SPIF==0 ) ;         // Wait for i/o complete
+	b = SPI0DAT;                       // Store rx data
 	SPI0CN0_SPIF = 0;                  // Clear SPI done flag
 	SPI0CN0_NSSMD0 = 1;                // Finish with SS
-	return rx;
-}
 
-//===========================================================================//
-// I2C (SMBus), p.224                                                        //
-//===========================================================================//
-//===========================================================================//
-void I2C_Reset(void)
-{
-	uint8_t i;
-	uint8_t xbr0   = XBR0;
-	uint8_t xbr1   = XBR1;
-	uint8_t p2out  = P2MDOUT;
-	uint8_t p2skip = P2SKIP;
-
-	// Check if slave is holding SDA low because of an improper reset or error.
-	while( I2C_SDA==0 )
-	{
-		// Provide clock pulses to allow the slave to advance out
-		// of its current state. This will allow it to release SDA.
-		XBR0     = 0;                  // Disable ALL perephirals
-		XBR1     = 0x40;               // Enable Crossbar
-		//P2MDOUT |= 0x03;               // Set i2C pins to Push-Pull
-		P2MDOUT  = 0xFC;               // Set i2C pins to Oped-Drain
-		P2SKIP   = 0;                  // Manual control over these pins
-		I2C_SCL  = 0;                  // Drive the clock low
-		for( i = 0; i < 255; i++ ) ;   // Hold the clock low
-		I2C_SCL  = 1;                  // Release the clock
-		while( I2C_SCL==0) {}          // Wait for open-drain pin to rise
-		for( i = 0; i < 50; i++ ) ;    // Hold the clock high
-		XBR1     = 0;                  // Disable Crossbar
-   }
-   P2MDOUT = p2out;                    // Restore config registers
-   P2SKIP  = p2skip;
-   XBR0    = xbr0;
-   XBR1    = xbr1;
-}
-
-//===========================================================================//
-// I2C_Master_Init() includes Timer1 and Timer3 init                         //
-// SMBus configured as follows:                                              //
-//    - SMBus enabled                                                        //
-//    - Slave mode inhibited                                                 //
-//    - Timer1 used as clock source, overflow at 1/3 the SCL rate            //
-//    - Setup and hold time extensions enabled                               //
-//    - Bus Free and SCL Low timeout detection enabled                       //
-// Note:                                                                     //
-//    Make sure the Timer1 can produce the required frequency in 8-bit mode. //
-//===========================================================================//
-void I2C_Master_Init(uint32_t nSpeed)
-{
-	// Timer1 configured as the I2C clock source, autoreload.
-	CKCON0 |= 0x08;                    // Timer1 clock source: SYSCLK
-	TMOD   |= 0x20;                    // Timer1 in 8-bit auto-reload mode
-	TH1 = 256 - g_SYSCLK/(nSpeed*3);   // Timer1 counter limit (62kHz min)
-	TL1 = TH1;                         // Timer1 initial value
-	// Timer3 configured for use by the I2C low timeout detect feature.
-	CKCON0 &= 0x3F;                    // Timer3 uses TMR3CN values
-	TMR3CN0 = 0x00;                    // Timer3: 16-bit autoreload, SYSCLK/12
-	TMR3RL = 65536 - g_SYSCLK/(12*100);// Timer3 configured to overflow after 10ms (~25ms)
-	TMR3     = TMR3RL;                 // Real max value: 16.3ms @48MHz:12:0xFFFF=61Hz
-	TCON_TR1 = 1;                      // Timer1 enable
-	TMR3CN0 |= 0x04;                   // Timer3 enable, see "Reset SMB in IRQ"
-	EIE1    |= 0x80;                   // Timer3 interrupt enable
-	// was: SMB0CF = 0x5D
-	//----------------------------------------------------------------//
-	// SMB0CF: || EnSMB | Inh | Busy|ExtHld||SmbTOE|SmbFTE| SMB CS || //
-	//         ||   0   |  1  |  0  |   1  ||  1   |  1   |   01   || //
-	//----------------------------------------------------------------//
-	SMB0CF  = 0x01;                    // SMB Clock Source: Timer1
-	SMB0CF |= 0x04;                    // Enable SMBus Free timeout detection
-	SMB0CF |= 0x08;                    // Enable SCL low timeout detection
-	SMB0CF |= 0x10;                    // Enable setup & hold time extensions
-	SMB0CF |= 0x40;                    // Slave inhibit (disable slave IRQs)
-	SMB0CF |= 0x80;                    // Enable I2C/SMBus
-	EIE1   |= 0x01;                    // Enable I2C/SMB interrupts
-}
-
-//===========================================================================//
-// Timer3 Interrupt Service Routine indicates an SMBus SCL low timeout.      //
-// The I2C/SMBus is disabled and re-enabled here.                            //
-//===========================================================================//
-void Timer3_ISR(void) interrupt TIMER3_IRQn
-{
-	SMB0CF     &= 0x7F;                // Disable SMBus
-	SMB0CF     |= 0x80;                // Re-enable SMBus
-	TMR3CN0    &= 0x7F;                // Clear Timer3 interrupt-pending flag
-	SMB0CN0_STA = 0;                   // Clear any START on the bus
-	_i2c.Busy   = 0;                   // Free I2C/SMBus state
-}
-
-//===========================================================================//
-typedef enum
-{
-	I2C_MASTER_START  = 0xE0,          // start transmitted (master)
-	I2C_MASTER_TXDATA = 0xC0,          // data byte transmitted (master)
-	I2C_MASTER_RXDATA = 0x80,          // data byte received (master)
-	I2C_SLAVE_ADDRESS = 0x20,          // slave address received (slave)
-	I2C_SLAVE_RX_STOP = 0x10,          // STOP detected during write (slave)
-	I2C_SLAVE_RXDATA  = 0x00,          // data byte received (slave)
-	I2C_SLAVE_TXDATA  = 0x40,          // data byte transmitted (slave)
-	I2C_SLAVE_TX_STOP = 0x50,          // STOP detected during a write (slave)
-} I2C_State_t;
-
-//===========================================================================//
-// I2C/SMBus Interrupt Service Routine (ISR)                                 //
-//===========================================================================//
-// I2C/SMBus ISR state machine                                               //
-//    - Master only implementation                                           //
-//    - All incoming data is written to _i2c.DataIn                          //
-//    - All outgoing data is read from _i2c.DataOut                          //
-//===========================================================================//
-void I2C_ISR(void) interrupt SMBUS0_IRQn
-{
-	bit bFail = 0;                     // Transmit error flag
-
-	if( SMB0CN0_ARBLOST==0 )           // no arbitration errors
-	{
-		switch( SMB0CN0 & 0xF0 )       // Get status bits for master (4-bits)
-		{
-			case I2C_MASTER_START:          // START condition transmitted
-				SMB0DAT     = _i2c.Data[0]; // Load address of the target slave
-				SMB0DAT    &= 0xFE;         // Clear the address for the R/W bit
-				SMB0DAT    |= _i2c.Read;    // Load R/W bit
-				SMB0CN0_STA = 0;            // Manually clear START bit
-				break;
-			case I2C_MASTER_TXDATA:    // Data byte transmitted
-				if( SMB0CN0_ACK )      // Slave has sent ACK (1) or NACK (0)
-				{
-					if( _i2c.Count )        // If there are bytes to send
-					{
-						if( _i2c.Read==0 )  // If this transfer is a WRITE,
-						{                   // Send data byte (from end of array)
-							SMB0DAT = _i2c.Data[ _i2c.Count ];
-							_i2c.Count--;       // Decrement byte counter
-						}
-						else                // Do nothing for READ cmd
-						{
-							// If this transfer is a READ, proceed with transfer
-							//  without writing to SMB0DAT (switch to receive mode)
-						}
-					}
-					else               // If there are no data bytes to send
-					{
-						SMB0CN0_STO = 1;    // Set STOP to terminate transfer
-						_i2c.Busy   = 0;    // And free SMBus interface
-					}
-				}
-				else                        // The slave has sent NACK
-				{
-					SMB0CN0_STO = 1;        // Send STOP condition, followed
-					SMB0CN0_STA = 1;        // by a START
-					_i2c.Errors++;          // Indicate error
-				}
-				break;
-			case I2C_MASTER_RXDATA:         // Data byte received
-				_i2c.Data[1] = SMB0DAT;     // Store received byte @1
-				_i2c.Busy    = 0;           // Free SMBus interface
-				SMB0CN0_ACK  = 0;           // Send NACK to indicate last byte tx
-				SMB0CN0_STO  = 1;           // Send STOP to terminate transfer
-				//SMB0CN0_ACK  = 1;         // Send ACK to continue RX
-				break;
-			default:
-				bFail = 1;             // Indicate failed transfer, see end of ISR
-				break;
-		} // end switch
-	}
-	else
-	{
-		// if SMB0CN_ARBLOST = 1, error occurred... abort transmission
-		bFail = 1;
-	}
-
-	if( bFail )                        // If the transfer failed...
-	{                                  // RESET to default values
-		bFail       = 0;               // Clear internal error flag
-		SMB0CF     &= 0x7F;            // Disable I2C/SMBus
-		SMB0CF     |= 0x80;            // Enable I2C/SMBus
-		SMB0CN0_STA = 0;               // No START sequence
-		SMB0CN0_STO = 0;               // No STOP condition
-		SMB0CN0_ACK = 0;               // No active ACK
-		_i2c.Busy   = 0;               // Free SMBus
-		_i2c.Errors++;                 // Indicate an error occurred
-	}
-	SMB0CN0_SI = 0;                    // Clear interrupt flag
-}
-
-
-//===========================================================================//
-// I2C_Write() - writes a single byte to the slave with address specified    //
-//               by the <TARGET> variable. See _i2c struct;                  //
-//===========================================================================//
-void I2C_Write(uint8_t addr, uint8_t value)
-{
-	while( _i2c.Busy) ;                // Wait for I2C/SMBus to be free.
-	_i2c.Count   = 1;                  // Number of bytes to transfer
-	_i2c.Data[0] = addr;               // Set slave address as a reciever
-	_i2c.Data[1] = value;              // Set value to transfer
-	_i2c.Busy    = 1;                  // Set I2C/SMBus to busy state
-	_i2c.Read    = 0;                  // Mark this transfer as a WRITE
-	SMB0CN0_STA  = 1;                  // Start transfer
-}
-
-//===========================================================================//
-void I2C_WriteReg(uint8_t addr, uint8_t reg, uint8_t value)
-{
-	while( _i2c.Busy) ;                // Wait for I2C/SMBus to be free.
-	_i2c.Count   = 2;                  // Number of bytes to transfer
-	_i2c.Data[0] = addr;               // Set slave address as a reciever
-	_i2c.Data[1] = value;              // Set Data#2 to transfer
-	_i2c.Data[2] = reg;                // Set Data#1 to transfer
-	_i2c.Busy    = 1;                  // Set I2C/SMBus to busy state
-	_i2c.Read    = 0;                  // Mark this transfer as a WRITE
-	SMB0CN0_STA  = 1;                  // Start transfer
-}
-
-//===========================================================================//
-// I2C_Read() - reads a single byte from the slave with address specified    //
-//              by the <TARGET> variable.                                    //
-//===========================================================================//
-uint8_t I2C_Read(uint8_t addr)
-{
-	// _i2c.Count not used, only 1 byte rx
-	while( _i2c.Busy) ;                // Wait for I2C/SMBus to be free.
-	_i2c.Count   = 1;                  // Number of bytes to recieve
-	_i2c.Data[0] = addr;               // Set slave address as a transmiter
-	_i2c.Data[1] = 0;                  // Set default value to 0
-	_i2c.Busy    = 1;                  // Set I2C/SMBus to busy state
-	_i2c.Read    = 1;                  // Mark this transfer as a READ
-	SMB0CN0_STA  = 1;                  // Start transfer
-	while( _i2c.Busy) ;                // Wait for transfer to complete
-	return _i2c.Data[1];
-}
-
-//===========================================================================//
-uint8_t I2C_ReadReg(uint8_t addr, uint8_t reg)
-{
-	I2C_Write( addr & 0xFE, reg );
-	return I2C_Read( addr | 0x01 );
+	return b;
 }
 
 //===========================================================================//
